@@ -86,7 +86,7 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static float int_adcData(void);
+static uint32_t int_adcData(void);
 
 #define ADC_DATA_BUFF_LEN       64
 #define ADC_CHANNEL_NUM         6
@@ -222,9 +222,9 @@ static void adc_data_proc(float data[6])
                     g_matrix.m[5][4] * data[4] + g_matrix.m[5][5] * data[5];
     }
 
-    // for (i = 0; i < ADC_CHANNEL_NUM; i++) {
-    //     g_sensor.force[i] = FloatFilter_UpdateChannel(i, g_sensor.force[i]);
-    // }
+    for (i = 0; i < ADC_CHANNEL_NUM; i++) {
+        g_sensor.force[i] = FloatFilter_UpdateChannel(i, g_sensor.force[i]);
+    }
 }
 
 /* W5500 callback: TIM2 period elapsed -> increment tick counter */
@@ -321,7 +321,7 @@ int32_t LHA7668_Platform_ReadWrite(uint8_t *txdata, uint8_t *rxdata, const uint1
     return 0;
 }
 
-static float int_adcData(void)
+static uint32_t int_adcData(void)
 {
     LHL_LHA7668_Start(&lha7668_ctx, LHA7668_MODE_SINGLE_SHOT);
 
@@ -628,8 +628,8 @@ int main(void)
         uart_debug("Flash config loaded OK\r\n");
     }
     calib_init();
-    g_sys.data_format = 2;
-    // FloatFilter_Init();
+    g_sys.data_format = 0;
+    FloatFilter_Init();
 
     /* ================================================================
     *  BOOT SELF-TEST

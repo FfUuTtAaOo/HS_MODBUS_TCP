@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/calibration.c
     Core/Src/lha7668.c
     Core/Src/self_test.c
+    Core/Src/filter.c
 )
 
 # Add include paths
