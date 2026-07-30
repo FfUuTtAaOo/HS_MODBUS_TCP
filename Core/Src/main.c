@@ -70,7 +70,7 @@ config_t                 g_config = {
     .ip         = {192,168,1,12},
     .subnet     = {255,255,255,0},
     .gateway    = {192,168,1,1},
-    .sn         = "HS-00000001",
+    .sn         = "HS-01234567",
     .fw_version = 0x0100,
 };
 decouple_matrix_t        g_matrix;

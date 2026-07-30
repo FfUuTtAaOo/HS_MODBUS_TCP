@@ -186,6 +186,11 @@ void rs485_send_raw(const uint8_t *data, uint16_t len)
     rs485_tx(tx, pos);
 }
 
+void original_send(const uint8_t *payload, uint16_t len)
+{
+    rs485_tx(payload, len);
+}
+
 void just_float_send_raw(const uint8_t *data, uint16_t len)
 {
     uint8_t tx[RS485_TX_BUF_SIZE];

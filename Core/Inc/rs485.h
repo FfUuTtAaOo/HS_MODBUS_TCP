@@ -72,6 +72,8 @@ void rs485_send_frame(uint8_t cmd, const uint8_t *payload, uint16_t len);
  */
 void rs485_send_raw(const uint8_t *data, uint16_t len);
 
+void original_send(const uint8_t *payload, uint16_t len);
+
 /**
  * Send a frame with the format [data...] 00 00 80 7F
  * (no extra command byte).

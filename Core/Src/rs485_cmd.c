@@ -86,7 +86,7 @@ void rs485_cmd_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
 
     /* ---- 0x05  Query serial number ---- */
     case RS485_CMD_QUERY_SN:
-        respond(cmd, (const uint8_t *)g_config.sn, (uint16_t)strlen(g_config.sn));
+        original_send((const uint8_t *)g_config.sn, (uint16_t)strlen(g_config.sn));
         break;
 
     /* ---- 0x06  Query firmware version ---- */

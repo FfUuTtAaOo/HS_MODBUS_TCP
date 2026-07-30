@@ -79,8 +79,8 @@ uint16_t mb_reg_read(uint16_t addr, uint16_t count,
 
         /* ---- SN: 8 words of ASCII (16 chars) ---- */
         case MB_REG_SN_BASE ... MB_REG_SN_END:
-            val = ((uint16_t)(uint8_t)g_config.sn[(a - MB_REG_SN_BASE) * 2])
-                | ((uint16_t)(uint8_t)g_config.sn[(a - MB_REG_SN_BASE) * 2 + 1] << 8);
+            val = ((uint16_t)(uint8_t)g_config.sn[(a - MB_REG_SN_BASE) * 2 + 1])
+                | ((uint16_t)(uint8_t)g_config.sn[(a - MB_REG_SN_BASE) * 2] << 8);
             break;
 
         /* ---- FW Version: 2 registers (major | minor) from BCD ---- */
