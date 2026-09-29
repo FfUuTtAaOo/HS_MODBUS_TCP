@@ -536,17 +536,24 @@ static void rs485_send_continuous(void)
                     mb_buf_send[9 + i*4 + 2] = (uint8_t)(u >> 16);
                     mb_buf_send[9 + i*4 + 3] = (uint8_t)(u >> 24);
                 }
-                for (uint8_t j = 0; j < 4; j++) {
-                    if (socket_connect_num[j] == 1) {
-                        mb_buf_send[0] = 0x00;
-                        mb_buf_send[1] = 0x00;
-                        mb_buf_send[2] = 0x00;
-                        mb_buf_send[3] = 0x00;
-                        mb_buf_send[4] = 0x00;
-                        mb_buf_send[5] = 0x1B;
-                        mb_buf_send[6] = 0x01;
-                        mb_buf_send[7] = 0x03;
-                        mb_buf_send[8] = 0x18;
+                /* MBAP header is identical for every socket — build it once
+                 * outside the loop instead of re-writing it per socket. */
+                mb_buf_send[0] = 0x00;   /* TID hi  = 0x0000 (unsolicited) */
+                mb_buf_send[1] = 0x00;   /* TID lo                         */
+                mb_buf_send[2] = 0x00;   /* PID     = 0x0000               */
+                mb_buf_send[3] = 0x00;
+                mb_buf_send[4] = 0x00;   /* LEN     = 27 (UID+FC+BC+24)    */
+                mb_buf_send[5] = 0x1B;
+                mb_buf_send[6] = 0x01;   /* UID     = 0x01                 */
+                mb_buf_send[7] = 0x03;   /* FC      = read holding regs    */
+                mb_buf_send[8] = 0x18;   /* BYTE_CNT = 24                  */
+                /* Gate on g_sock[].connected (maintained on every disconnect
+                 * path), NOT on socket_connect_num[] — see the socket state
+                 * machine below for why. Sending to a torn-down socket used to
+                 * spin inside w5500_socket_send() for up to 2 s per frame and
+                 * stall this loop. */
+                for (uint8_t j = 0; j < W5500_SOCK_COUNT; j++) {
+                    if (g_sock[j].connected) {
                         w5500_socket_send(j, mb_buf_send, 33);
                     }
                 }
@@ -805,28 +812,64 @@ int main(void)
         }
 
         /* ================================================================
-        *  RS485: continuous data output  (send_mode == 1)
-        *         single-shot output      (send_mode == 2)
+        *  Data output — target interface is output_interface:
+        *      1 = RS485
+        *      2 = Modbus-TCP
+        *
+        *  send_mode == 1 → continuous output
+        *  send_mode == 2 → single-shot: emit exactly one frame, then stop
         * ================================================================ */
         if (g_sys.send_mode == 1) {
             rs485_send_continuous();
         } else if (g_sys.send_mode == 2) {
-            /* Single-shot: send one data frame then stop */
-            uint8_t buf[31];
-            uint32_t seq = g_sys.frame_seq++;
-            buf[0] = RS485_CMD_CONT_DATA;
-            buf[1] = (uint8_t)(seq);
-            buf[2] = (uint8_t)(seq >> 8);
-            buf[3] = (uint8_t)(seq >> 16);
-            buf[4] = (uint8_t)(seq >> 24);
-            for (int i = 0; i < 6; i++) {
-                float f = g_sensor.force[i];
-                uint32_t u; memcpy(&u, &f, 4);
-                buf[5 + i*4 + 0] = (uint8_t)(u);
-                buf[5 + i*4 + 1] = (uint8_t)(u >> 8);
-                buf[5 + i*4 + 2] = (uint8_t)(u >> 16);
+            /* Single-shot: emit exactly one data frame on the currently
+             * selected interface, then auto-reset to the stopped state.
+             * Triggered by a Modbus write to register 0x0003. */
+            if (output_interface == 2) {
+                /* ---- Modbus-TCP: one 33-byte FC03-style data frame ---- */
+                mb_buf_send[0] = 0x00;   /* TID hi  = 0x0000 (unsolicited) */
+                mb_buf_send[1] = 0x00;   /* TID lo                          */
+                mb_buf_send[2] = 0x00;   /* PID     = 0x0000                */
+                mb_buf_send[3] = 0x00;
+                mb_buf_send[4] = 0x00;   /* LEN     = 27 (UID+FC+BC+24)     */
+                mb_buf_send[5] = 0x1B;
+                mb_buf_send[6] = 0x01;   /* UID     = 0x01                  */
+                mb_buf_send[7] = 0x03;   /* FC      = read holding regs     */
+                mb_buf_send[8] = 0x18;   /* BYTE_CNT = 24                   */
+                for (int i = 0; i < 6; i++) {
+                    float f = g_sensor.force[i];
+                    uint32_t u; memcpy(&u, &f, 4);
+                    mb_buf_send[9 + i * 4 + 0] = (uint8_t)(u);
+                    mb_buf_send[9 + i * 4 + 1] = (uint8_t)(u >> 8);
+                    mb_buf_send[9 + i * 4 + 2] = (uint8_t)(u >> 16);
+                    mb_buf_send[9 + i * 4 + 3] = (uint8_t)(u >> 24);
+                }
+                /* Gate on g_sock[].connected — see the continuous-output path
+                 * above for the rationale (socket_connect_num[] is not cleared
+                 * on every disconnect path). */
+                for (uint8_t j = 0; j < W5500_SOCK_COUNT; j++) {
+                    if (g_sock[j].connected) {
+                        w5500_socket_send(j, mb_buf_send, 33);
+                    }
+                }
+            } else {
+                /* ---- RS485: AA 55 [SEQ 4B] [6×float32 LE] 0D 0A ---- */
+                uint8_t buf[31];
+                uint32_t seq = g_sys.frame_seq++;
+                buf[0] = RS485_CMD_CONT_DATA;
+                buf[1] = (uint8_t)(seq);
+                buf[2] = (uint8_t)(seq >> 8);
+                buf[3] = (uint8_t)(seq >> 16);
+                buf[4] = (uint8_t)(seq >> 24);
+                for (int i = 0; i < 6; i++) {
+                    float f = g_sensor.force[i];
+                    uint32_t u; memcpy(&u, &f, 4);
+                    buf[5 + i*4 + 0] = (uint8_t)(u);
+                    buf[5 + i*4 + 1] = (uint8_t)(u >> 8);
+                    buf[5 + i*4 + 2] = (uint8_t)(u >> 16);
+                }
+                rs485_send_raw(buf, 29);
             }
-            rs485_send_raw(buf, 29);
             g_sys.send_mode = 0;   /* auto-reset after single shot */
         } else {
             g_last_rs485_send_ms = g_tick_ms;   /* reset timer on stop */
@@ -857,9 +900,15 @@ int main(void)
                 uart_debug(conn[i]);
             }
 
-            /* Fallback: ESTABLISHED detected by status poll */
+            /* NOTE: g_sock[i].connected and socket_connect_num[i] are two
+             * views of the same thing and MUST be updated together. The data
+             * output paths gate on g_sock[].connected, so every branch that
+             * drops a connection has to clear it — including the two branches
+             * that `continue` and therefore never reach the silent-disconnect
+             * check further down. */
             if (sr == SOCK_ESTABLISHED && !g_sock[i].connected) {
                 g_sock[i].connected = 1;
+                socket_connect_num[i] = 1;
                 g_sock[i].last_tick = g_tick_ms;
                 uart_debug("Client connected (poll)\r\n");
             }
@@ -868,6 +917,7 @@ int main(void)
             if (ir & Sn_IR_DISCON) {
                 w5500_socket_ir_clear(i, Sn_IR_DISCON);
                 g_sock[i].connected = 0;
+                socket_connect_num[i] = 0;
                 w5500_socket_close(i);
                 w5500_socket_init(i, W5500_PORT);
                 w5500_socket_listen(i);
@@ -880,6 +930,7 @@ int main(void)
             if (ir & Sn_IR_TIMEOUT) {
                 w5500_socket_ir_clear(i, Sn_IR_TIMEOUT);
                 g_sock[i].connected = 0;
+                socket_connect_num[i] = 0;
                 w5500_socket_close(i);
                 w5500_socket_init(i, W5500_PORT);
                 w5500_socket_listen(i);
@@ -913,6 +964,7 @@ int main(void)
                 if (sr != last_sr[i]) {
                     if (g_sock[i].connected) {
                         g_sock[i].connected = 0;
+                        socket_connect_num[i] = 0;
                         w5500_socket_close(i);
                     }
                     w5500_socket_init(i, W5500_PORT);

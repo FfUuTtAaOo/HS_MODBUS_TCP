@@ -16,7 +16,7 @@ static void build_echo(uint8_t *buf, const uint8_t *rx, uint8_t fc,
 {
     /* Copy MBAP header (first 6 bytes) verbatim, then fill len+uid+FC */
     memcpy(buf, rx, 6);
-    uint16_t pdu_len = (uint16_t)(1 + data_len);        /* UID + FC + data */
+    uint16_t pdu_len = (uint16_t)(2 + data_len);        /* UID + FC + data */
     buf[MBAP_LEN]     = (uint8_t)(pdu_len >> 8);
     buf[MBAP_LEN + 1] = (uint8_t)(pdu_len);
     buf[MBAP_UID]     = rx[MBAP_UID];
@@ -87,8 +87,8 @@ int modbus_tcp_process(uint8_t sock, const uint8_t *rx_buf, uint16_t rx_len,
 
         /* Echo entire request */
         build_echo(tx, rx_buf, fc,
-                   rx_buf + MBAP_HDR_LEN + 1, (uint16_t)(pdu_len - 1));
-        resp_len = (uint16_t)(MBAP_HDR_LEN + pdu_len);
+                   rx_buf + MBAP_HDR_LEN + 1, 4);
+        resp_len = (uint16_t)(6 + pdu_len);
         break;
     }
 

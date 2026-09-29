@@ -308,13 +308,25 @@ void w5500_socket_ir_clear(uint8_t sock, uint8_t mask)
 uint8_t w5500_socket_send(uint8_t sock, const uint8_t *data, uint16_t len)
 {
     uint8_t block = W5500_BS_SOCK(sock);
-    uint16_t tx_fsr;
+    uint16_t tx_fsr = 0;
     uint16_t tx_wr;
     uint16_t phy_addr;
     uint32_t timeout;
+    uint8_t  sr;
 
-    /* Check free TX buffer space */
-    timeout = 1000;
+    /* ---- Guard: never touch a socket that is not actually up ----
+     * Sn_TX_FSR never becomes ready on a CLOSED socket, so without this check
+     * the wait loop below burns its full timeout on every single call. This
+     * function is called from a 500 Hz streaming loop, i.e. up to ~2 s of
+     * blocking per frame — enough to stall the main loop until the device
+     * stops answering Modbus requests altogether. */
+    sr = w5500_read_byte(block, Sn_SR);
+    if (sr != SOCK_ESTABLISHED && sr != SOCK_CLOSE_WAIT) {
+        return 0;
+    }
+
+    /* Check free TX buffer space (bounded — see the guard above) */
+    timeout = 100;
     do {
         tx_fsr = w5500_read_word(block, Sn_TX_FSR);
         if (tx_fsr >= len) break;
@@ -338,8 +350,8 @@ uint8_t w5500_socket_send(uint8_t sock, const uint8_t *data, uint16_t len)
     /* Issue SEND command */
     w5500_write_byte(block, Sn_CR, Sn_CR_SEND);
 
-    /* Wait for SEND_OK */
-    timeout = 1000;
+    /* Wait for SEND_OK (bounded — a dying link must not block the caller) */
+    timeout = 100;
     while (--timeout) {
         uint8_t ir = w5500_read_byte(block, Sn_IR);
         if (ir & Sn_IR_SEND_OK) {

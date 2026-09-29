@@ -88,7 +88,12 @@ extern "C" {
 #define MB_REG_ST_RS485      0x0214  /* RS485 UART + DMA status           */
 #define MB_REG_ST_FLASH      0x0215  /* Flash valid + matrix + zero + cfg */
 
-/* ---- Block boundaries (for valid_range grouped checks) ---------- */
+/* ---- Block boundaries (for valid_range grouped checks) ----------
+ * IMPORTANT: `_END` is the INCLUSIVE last register address, and it must be
+ * exactly covered by the matching `case` range in mb_reg_read(). A block end
+ * that reaches past the case range makes valid_range() pass while the per-word
+ * switch falls through to `default` and answers exception 0x02.
+ * ----------------------------------------------------------------- */
 #define MB_BLK_TRIG_START    0x0001
 #define MB_BLK_TRIG_END      0x0003
 
@@ -96,7 +101,9 @@ extern "C" {
 #define MB_BLK_INFO_END      0x0010
 
 #define MB_BLK_CTRL_START    0x0030
-#define MB_BLK_CTRL_END      0x003E      /* ZERO + UNZERO + FORMAT + FORCE */
+#define MB_BLK_CTRL_END      0x003E      /* ZERO + UNZERO + FORMAT + FORCE ×6
+                                          * (0x33..0x3E = 12 regs, MZ high word
+                                          *  0x3E included)                  */
 
 #define MB_BLK_ZERO_START    0x0050
 #define MB_BLK_ZERO_END      0x005B
@@ -105,7 +112,9 @@ extern "C" {
 #define MB_BLK_OVL_END       0x007B
 
 #define MB_BLK_RANGE_START   0x007C
-#define MB_BLK_RANGE_END     0x0093
+#define MB_BLK_RANGE_END     0x0093      /* 6 axes × (min+max) × 2 words
+                                          * (0x7C..0x93 = 24 regs, MZ_MAX high
+                                          *  word 0x93 included)             */
 
 #define MB_BLK_NET_START     0x0100
 #define MB_BLK_NET_END       0x010B

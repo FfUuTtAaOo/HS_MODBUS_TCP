@@ -3,6 +3,7 @@
 #include "flash_storage.h"
 #include "self_test.h"
 #include <string.h>
+#include "filter.h"
 
 extern uint8_t output_interface;
 
@@ -97,8 +98,14 @@ uint16_t mb_reg_read(uint16_t addr, uint16_t count,
         case MB_REG_DATA_FORMAT:
             val = g_sys.data_format; break;
 
-        /* ---- Force / Torque (float32 LE, 2 words each) ---- */
-        case MB_REG_FORCE_FX ... MB_REG_TORQUE_MZ: {
+        /* ---- Force / Torque (float32 LE, 2 words each) ----
+         * NOTE: the range must include the HIGH word of the 6th axis.
+         * MZ occupies 0x003D (low) + 0x003E (high) → 12 registers total,
+         * which is exactly what MB_BLK_CTRL_END (0x003E) promises. Without
+         * the "+ 1" the last register fell through to `default`, so a request
+         * for the full 12-register block passed valid_range() but was then
+         * rejected with exception 0x02 — and channel 6 was unreadable. */
+        case MB_REG_FORCE_FX ... MB_REG_TORQUE_MZ + 1: {
             int ch = (int)(a - MB_REG_FORCE_FX) / 2;
             int lo = ((a - MB_REG_FORCE_FX) % 2) == 0;
             uint32_t u;
@@ -129,8 +136,11 @@ uint16_t mb_reg_read(uint16_t addr, uint16_t count,
             break;
         }
 
-        /* ---- Threshold Range (float32 LE, 4 words per axis: min lo/hi, max lo/hi) ---- */
-        case MB_REG_RANGE_FX_MIN ... MB_REG_RANGE_MZ_MAX: {
+        /* ---- Threshold Range (float32 LE, 4 words per axis: min lo/hi, max lo/hi) ----
+         * Same off-by-one as the force block above: MZ_MAX occupies
+         * 0x0092 (low) + 0x0093 (high) → 24 registers total, matching
+         * MB_BLK_RANGE_END (0x0093). */
+        case MB_REG_RANGE_FX_MIN ... MB_REG_RANGE_MZ_MAX + 1: {
             int ch  = (int)(a - MB_REG_RANGE_FX_MIN) / 4;
             int sub = (int)(a - MB_REG_RANGE_FX_MIN) % 4;  /* 0/1=min, 2/3=max */
             float f = (sub < 2) ? g_threshold.range_min[ch] : g_threshold.range_max[ch];
@@ -213,7 +223,14 @@ uint16_t mb_reg_write_single(uint16_t addr, uint16_t value, uint8_t *exc)
         output_interface = 2;
         break;
     case MB_REG_SINGLE:
+        /* Single-shot conversion. The frame is emitted on the currently
+         * selected output interface (see main loop): 1 = RS485, 2 = Modbus-TCP.
+         * This register is only reachable over Modbus-TCP, so if no interface
+         * has been selected yet, default to Modbus-TCP — otherwise a client
+         * that never wrote 0x0002 would trigger nothing at all.
+         * An already active interface (e.g. RS485 streaming) is NOT stolen. */
         g_sys.send_mode = 2;
+        if (output_interface == 0) output_interface = 2;
         break;
     case MB_REG_ZERO_TRIG:
         calib_zero_start();
@@ -228,6 +245,7 @@ uint16_t mb_reg_write_single(uint16_t addr, uint16_t value, uint8_t *exc)
     case MB_REG_DATA_FORMAT:
         if (value > 2) { *exc = MB_EX_ILLEGAL_DATA; return 0; }
         g_sys.data_format = (uint8_t)value;
+        FloatFilter_Init();
         break;
     case MB_REG_STATUS:
         g_sys.status_flags = value;
@@ -280,6 +298,7 @@ uint16_t mb_reg_write_multi(uint16_t addr, uint16_t count,
                 g_config.gateway[(addr - MB_REG_GATEWAY) * 2 + 1] = (uint8_t)(val);
             }
         }
+        flash_save_zero();
         return count * 2U;
     }
 
