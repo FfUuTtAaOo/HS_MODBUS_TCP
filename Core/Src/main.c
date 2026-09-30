@@ -614,26 +614,26 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   /* Load persistent config / matrix / zero from Flash */
-    if (!flash_load_all()) {
-        uart_debug("Flash empty — using NaN placeholders\r\n");
-        /* Flash is empty / never written → fill matrix & zero with NaN
-        * so all force outputs become NaN, clearly distinguishing
-        * "uncalibrated" from "zero load" (which would output 0.0). */
-        static const uint32_t nan_bits = 0x7FC00000U;
-        float nan_val;
-        memcpy(&nan_val, &nan_bits, 4);
-        for (int i = 0; i < 6; i++) {
-            g_sensor.force_zero[i] = nan_val;
-            g_threshold.overload[i]  = nan_val;
-            g_threshold.range_min[i] = nan_val;
-            g_threshold.range_max[i] = nan_val;
-            for (int j = 0; j < 6; j++) {
-                g_matrix.m[i][j] = nan_val;
-            }
-        }
-    } else {
-        uart_debug("Flash config loaded OK\r\n");
-    }
+    // if (!flash_load_all()) {
+    //     uart_debug("Flash empty — using NaN placeholders\r\n");
+    //     /* Flash is empty / never written → fill matrix & zero with NaN
+    //     * so all force outputs become NaN, clearly distinguishing
+    //     * "uncalibrated" from "zero load" (which would output 0.0). */
+    //     static const uint32_t nan_bits = 0x7FC00000U;
+    //     float nan_val;
+    //     memcpy(&nan_val, &nan_bits, 4);
+    //     for (int i = 0; i < 6; i++) {
+    //         g_sensor.force_zero[i] = 0;
+    //         g_threshold.overload[i]  = nan_val;
+    //         g_threshold.range_min[i] = nan_val;
+    //         g_threshold.range_max[i] = nan_val;
+    //         for (int j = 0; j < 6; j++) {
+    //             g_matrix.m[i][j] = nan_val;
+    //         }
+    //     }
+    // } else {
+    //     uart_debug("Flash config loaded OK\r\n");
+    // }
     calib_init();
     g_sys.data_format = 0;
     FloatFilter_Init();
@@ -939,15 +939,35 @@ int main(void)
                 continue;
             }
 
-            /* ---- Data received → Modbus-TCP processing ---- */
-            if (ir & Sn_IR_RECV) {
-                uint16_t rx_len = w5500_socket_recv_size(i);
-                if (rx_len > 0) {
-                    uint8_t buf[MB_TCP_RX_BUF_SIZE];
-                    uint16_t n = (rx_len < sizeof(buf)) ? rx_len : sizeof(buf);
-                    w5500_socket_recv(i, buf, n);
-                    modbus_tcp_process(i, buf, n, mb_tcp_send_cb, NULL);
+            /* ---- Data received → Modbus-TCP processing ----
+             *
+             * 关键：**不要依赖 Sn_IR_RECV 的边沿，改为每轮直接查 RX 缓冲**。
+             * SOCK_RECV 只在「数据落入 RX 缓冲」那一刻置位一次。旧实现的
+             * 顺序是「先读数据、处理、最后清标志」—— 若在处理窗口内又来
+             * 一个请求，新置位的标志会被随后的清除动作一并抹掉：数据明明
+             * 躺在 RX 缓冲里，却再也没有事件来触发读取，只能等再下一个请求
+             * 把它重新置位。上位机看到的就是「响应迟到整整一轮」甚至彻底
+             * 超时（这也解释了为什么「读数据都出问题」看起来是随机的）。
+             * 轮询不会丢事件；代价只是每轮每个 socket 多两次 SPI 寄存器读，
+             * 500 Hz 主循环下可忽略。
+             *
+             * 同时用 *_stream() 逐帧处理：TCP 是字节流，一次取回的数据里
+             * 可能粘着多个请求，只处理第一帧会静默丢弃其余请求。 */
+            {
+                uint8_t buf[MB_TCP_RX_BUF_SIZE];
+                for (uint8_t guard = 0; guard < 4; guard++) {
+                    /* 用 recv 的返回值，不要另外预读 Sn_RX_RSR：两处读到的
+                     * 长度可能不一致（接收过程中寄存器会更新），按预读值
+                     * 去处理就会越界读到未初始化数据。 */
+                    uint16_t n = w5500_socket_recv(i, buf, sizeof(buf));
+                    if (n == 0) break;
+                    modbus_tcp_process_stream(i, buf, n, mb_tcp_send_cb, NULL);
+                    if (n < sizeof(buf)) break;   /* 已读空 */
                 }
+            }
+            if (ir & Sn_IR_RECV) {
+                /* 数据已由上面的轮询取走，把标志清掉，不要让它在后面的
+                 * 循环里被当成新事件（清早了也只是少一次无用轮询）。 */
                 w5500_socket_ir_clear(i, Sn_IR_RECV);
             }
 

@@ -87,7 +87,7 @@ dist\hs_host.exe --selftest
 
 **上位机的处理方式**（不需要你手工试）：
 
-* 工具栏把两条口径**分开设置**：「轮询 FC03 字节序」与「写入 FC10 / 推流 字节序」，
+* 工具栏把两条口径**分开设置**：「轮询 FC03 字节序」与「单次 / 写入 FC10 / 推流 字节序」，
   默认值分别是 `CDAB` 与 `DCBA`，即真机固件的实际行为；
 * **连接时自动探测**：读阈值范围 `0x007C~0x007F`（出厂 `0.1 / 50000.0`）与过载阈值
   `0x0070~0x007B`（出厂 `2000/2000/5000/200/200/200`）作交叉判据，唯一确定轮询字节序；
@@ -213,20 +213,33 @@ TID=0000  PID=0000  LEN=001B  UID=01  FC=03  BYTE_CNT=18  6 × float32(24B)
 ```bash
 python hs_simulator.py                      # 默认即修复后的固件形态：读 CDAB / 单次·写·推流 DCBA、块尾 0x003E/0x0093
 python hs_simulator.py --port 15020 --rate 200
-python hs_simulator.py --port 15021 --legacy-blocks --legacy-single   # 完全复刻未修复的旧固件
+python hs_simulator.py --port 15021 --legacy-blocks --legacy-single --legacy-sticky   # 完全复刻未修复的旧固件
 ```
 
-模拟器默认复刻**已修复固件**的行为（块尾 `0x003E`/`0x0093` 可读、单次转换回送 TCP 帧，
-三条路径仍是三种字节序 —— 那部分按需求未改，**单次帧归入推流口径 `DCBA`**）。
-`--legacy-blocks`（块尾短一格）与 `--legacy-single`（单次帧只发 RS485）可分别切回
-**未修复旧固件**的两处行为，用来验证上位机对接未升级设备时不会误报。
+模拟器默认复刻**已修复固件**的行为（块尾 `0x003E`/`0x0093` 可读、单次转换回送 TCP 帧、
+**一个报文段里的多个请求全部逐个应答**，三条路径仍是三种字节序 —— 那部分按需求未改，
+**单次帧归入推流口径 `DCBA`**）。
+
+三个 `--legacy-*` 开关分别切回**未修复旧固件**的一处行为，用来验证上位机对接
+未升级设备时不会误报，也用来钉住修复效果：
+
+| 开关 | 复刻的旧行为 | 对应缺陷 |
+|:--|:--|:--|
+| `--legacy-blocks` | 块尾短一格，Mz 读不全 | P0-1 |
+| `--legacy-single` | 单次帧只发 RS485，TCP 收不到 | P1-6 |
+| `--legacy-sticky` | **一次 recv 只处理第一帧，同批其余请求被丢弃** | P0-4 |
 
 自动化测试（建议先跑这两个，确认环境与协议都正常）：
 
 ```bash
 python hs_simulator.py --port 15020                   # 另开终端
-python test_link.py --port 15020     # 协议层 31 项检查
-python test_gui.py  --port 15020     # 界面 + 协议 24 项检查
+python test_link.py --port 15020     # 协议层 43 项检查（含 12b 组协议一致性 + TCP 粘包双向断言）
+python test_gui.py  --port 15020     # 界面 + 协议 27 项检查
+
+# 对接未修复旧固件形态（三个开关可分别使用）：
+python hs_simulator.py --port 15021 --legacy-blocks --legacy-single --legacy-sticky
+python test_link.py --port 15021 --legacy-sticky --force-regs 11 --range-regs 23 --no-single-push
+```
 
 # 对接未修复的旧固件：
 python hs_simulator.py --port 15021 --legacy-blocks --legacy-single
@@ -288,6 +301,24 @@ python hs_modbus.py --host 192.168.1.12
 2. 用 `python hs_mapscan.py <设备IP>` 扫出真实可读区间，对照第 2 节的表；
 3. 根本解法是给设备烧入含 P0-1 修复的固件（`build/Verify/hs.hex`），
    或按审查报告把 `mb_reg_read()` 的两处 `case` 终止值各加 `+ 1`。
+
+**连上后「读取」随机报「操作失败：等待响应超时」？**
+这是**固件在「两个请求紧挨着到达」时会把后一个丢掉**造成的（缺陷编号 P0-4，
+详见 `Docs/modbus-tcp-实现审查.md`），**已在固件中修复**。
+
+判定方法：先用探针逐条读，若 12 项全 OK，说明协议本身没问题，问题只出在
+「连续 / 并发请求」这条路径上：
+
+```bash
+python hs_probe.py 192.168.1.12      # 只做 FC03 读，不写设备；正常应 12/12
+```
+
+- **根本解法**：给设备烧入含 P0-4 修复的固件 —— `build/Verify/hs.hex`
+  （根目录另存了副本 `hs_v1_0_fix_tcp_sticky.hex`）。
+- **过渡期**：上位机已对**只读请求（FC03）**加了「超时自动重试一次」，旧固件上的
+  偶发超时会变成「稍慢但成功」，日志里会出现「只读请求自动重试第 1 次」。
+  写请求（FC06/FC10）不重试，避免对设备产生重复副作用。
+- 避免同时用两个上位机 / 工具连同一台设备交替操作，那会人为制造并发请求。
 
 **数值乱跳 / 量级离谱（1e17 之类）？**
 字节序不对。点「读取字节序自检」重新判定，或确认两个下拉框是

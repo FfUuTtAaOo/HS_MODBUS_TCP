@@ -347,6 +347,16 @@ uint8_t w5500_socket_send(uint8_t sock, const uint8_t *data, uint16_t len)
     /* Update TX write pointer */
     w5500_write_word(block, Sn_TX_WR, tx_wr + len);
 
+    /* Clear any SEND_OK / TIMEOUT left over from an earlier transmission.
+     * The wait loop below has a bounded number of retries: if a slow peer
+     * keeps the ACK past that window we bail out and leave the bits as they
+     * were. A stale SEND_OK would then be seen by the *next* call on its very
+     * first read, which would report "sent" while this frame is actually
+     * still queued in the TX buffer — it only goes out when some later SEND
+     * flushes it, i.e. the peer sees every answer one request late.
+     * Clearing before issuing SEND is safe: SEND_OK is raised by this SEND. */
+    w5500_write_byte(block, Sn_IR, Sn_IR_SEND_OK | Sn_IR_TIMEOUT);
+
     /* Issue SEND command */
     w5500_write_byte(block, Sn_CR, Sn_CR_SEND);
 
@@ -365,6 +375,9 @@ uint8_t w5500_socket_send(uint8_t sock, const uint8_t *data, uint16_t len)
         HAL_Delay(1);
     }
 
+    /* Timed out — drop whatever this SEND raised so it can never be
+     * mistaken for the result of a later transmission. */
+    w5500_write_byte(block, Sn_IR, Sn_IR_SEND_OK | Sn_IR_TIMEOUT);
     return 0;
 }
 
@@ -376,13 +389,22 @@ uint16_t w5500_socket_recv_size(uint8_t sock)
 uint16_t w5500_socket_recv(uint8_t sock, uint8_t *buf, uint16_t len)
 {
     uint8_t block = W5500_BS_SOCK(sock);
-    uint16_t rx_rsr;
+    uint16_t rx_rsr, rx_rsr2;
     uint16_t rx_rd;
     uint16_t phy_addr;
     uint16_t read_len;
 
-    rx_rsr = w5500_read_word(block, Sn_RX_RSR);
-    if (rx_rsr == 0) {
+    /* Sn_RX_RSR 是 16 位寄存器，会在接收过程中被硬件随时更新，单次读取
+     * 可能拿到「高字节已更新、低字节还是旧值」的撕裂值。W5500 手册要求
+     * 连读两次并比对。这里读两次，不一致时以第二次为准，并且把明显超出
+     * RX 缓冲容量的值当作撕裂丢弃 —— 调用方是每轮主循环轮询的，下一轮
+     * 自然能读到稳定值，不会丢数据。 */
+    rx_rsr  = w5500_read_word(block, Sn_RX_RSR);
+    rx_rsr2 = w5500_read_word(block, Sn_RX_RSR);
+    if (rx_rsr != rx_rsr2) {
+        rx_rsr = rx_rsr2;
+    }
+    if (rx_rsr == 0 || rx_rsr > W5500_SOCK_BUF_MAX) {
         return 0;
     }
 

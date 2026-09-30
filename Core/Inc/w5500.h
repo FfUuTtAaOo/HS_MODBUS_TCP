@@ -95,6 +95,10 @@ extern "C" {
  * ================================================================ */
 #define W5500_SOCK_COUNT      4     /* Sockets used: 0-3 */
 #define W5500_SOCK_BUF_KB     2     /* TX+RX buffer per socket (KB) */
+/* Upper bound of a valid Sn_RX_RSR reading. A larger value can only be a
+ * torn read of that register (the W5500 updates it while we shift it out),
+ * so w5500_socket_recv() discards it and retries on the next poll. */
+#define W5500_SOCK_BUF_MAX    (W5500_SOCK_BUF_KB * 1024)
 
 /* ================================================================
  *  API Functions

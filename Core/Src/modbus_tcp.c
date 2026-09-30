@@ -131,3 +131,49 @@ int modbus_tcp_process(uint8_t sock, const uint8_t *rx_buf, uint16_t rx_len,
     if (send_fn) send_fn(sock, tx, resp_len, ctx);
     return (exc != MB_EX_NONE) ? (int)exc : 0;
 }
+
+/* ================================================================
+ *  modbus_tcp_process_stream
+ *
+ *  为什么需要这个函数（真实故障根因）：
+ *
+ *  TCP 是字节流，不是消息流。客户端把两个请求先后各发一次（例如上位机
+ *  的「连接后自动探测」跑在后台线程、用户同时点了界面按钮），这两个
+ *  请求完全可能落在同一个 TCP 段里、被本端一次 recv() 全部取回。
+ *  旧实现把整段缓冲直接交给 modbus_tcp_process()，而后者只解析**第一帧**，
+ *  于是同一批里的第 2..N 个请求被静默丢弃：
+ *    - 请求方收不到任何响应 → 「等待响应超时」；
+ *    - 更糟的是其中有写操作（FC06/FC10）时，请求方以为失败、实际却可能
+ *      已执行，状态与界面显示不一致。
+ *
+ *  这里按每帧自带的 MBAP LEN 字段逐帧切分，把缓冲里**所有完整请求**都
+ *  处理掉；末尾若残留一个不完整帧则停下（调用方缓冲按 MB_TCP_RX_BUF_SIZE
+ *  分配，单个 ADU 最大 260 字节，正常不会被切开）。
+ * ================================================================ */
+int modbus_tcp_process_stream(uint8_t sock, const uint8_t *rx_buf, uint16_t rx_len,
+                              mb_tcp_send_fn send_fn, void *ctx)
+{
+    uint16_t off     = 0;
+    int      handled = 0;
+
+    while ((uint16_t)(rx_len - off) >= MBAP_HDR_LEN + 1) {
+        uint16_t pid = ((uint16_t)rx_buf[off + MBAP_PID] << 8)
+                     |  rx_buf[off + MBAP_PID + 1];
+        uint16_t len = ((uint16_t)rx_buf[off + MBAP_LEN] << 8)
+                     |  rx_buf[off + MBAP_LEN + 1];
+        uint16_t frame_len = (uint16_t)(6 + len);
+
+        /* 协议 ID 必须为 0；异常帧丢弃首字节重新同步（与单帧路径一致） */
+        if (pid != 0) { off++; continue; }
+        /* LEN 非法：LO 至少含 UID + FC，整帧不得超过单 ADU 上限 */
+        if (len < 2 || frame_len > MB_TCP_RX_BUF_SIZE) { off++; continue; }
+        /* 帧尾不完整：留待下一次 RECV 事件，不要消费 */
+        if ((uint16_t)(rx_len - off) < frame_len) break;
+
+        (void)modbus_tcp_process(sock, rx_buf + off, frame_len, send_fn, ctx);
+        off = (uint16_t)(off + frame_len);
+        handled++;
+    }
+
+    return handled;
+}
