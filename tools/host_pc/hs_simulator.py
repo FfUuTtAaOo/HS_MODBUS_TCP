@@ -244,7 +244,6 @@ class DeviceServer:
                 active = self.dev.send_mode == 1
             if not active:
                 continue
-            self.dev.update_force()
 
             interval = 1.0 / max(self.dev.rate, 1.0)
             t_next = time.perf_counter()
@@ -252,6 +251,11 @@ class DeviceServer:
                 with self.dev.lock:
                     if self.dev.send_mode != 1:
                         break
+                # 每一帧都重新生成一次力数据。真机是每个采样周期都重新采集的，
+                # 若只在进入推流时算一次，整段推流会推出同一个值
+                # （波形变成直线、保存下来的 Excel 每行都一样）。
+                self.dev.update_force()
+                with self.dev.lock:
                     seq = self.dev.frame_seq
                     self.dev.frame_seq += 1
                     vals = list(self.dev.force)

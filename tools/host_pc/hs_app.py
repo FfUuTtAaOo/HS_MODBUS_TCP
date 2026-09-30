@@ -21,10 +21,12 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from collections import deque
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, List, Optional
 
 from hs_modbus import AXIS_NAMES, ByteOrder, Format, FreqMode, SensorClient
+from hs_xlsx import XlsxLimitError, XlsxTableWriter
 
 # ---------------------------------------------------------------------
 #  外观常量
@@ -38,6 +40,21 @@ TXT = "#22262b"
 TXT_DIM = "#707780"
 GRID = "#e8ebef"
 AXIS = "#c6cbd2"
+
+# 「保存数据」写出的 Excel 表头：就是六维力的六个通道，顺序固定
+SAVE_HEADERS = ("FX", "FY", "FZ", "TX", "TY", "TZ")
+
+
+def app_dir() -> str:
+    """
+    程序所在目录。
+
+    打包成单文件 exe 后 `sys.executable` 就是 exe 自身，
+    所以数据文件默认落在 exe 同目录；源码运行时落在脚本目录。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 FMT_LABEL = {Format.MV: "原始数据 (mV)", Format.KG: "矩阵滤波 (kg)",
              Format.N: "矩阵滤波 (N)"}
@@ -183,7 +200,8 @@ def _fmt_tick(v: float) -> str:
 class MainWindow:
 
     def __init__(self, root: tk.Tk, host: str, port: int, order: str,
-                 write_order: Optional[str] = None):
+                 write_order: Optional[str] = None,
+                 save_dir: Optional[str] = None):
         self.root = root
         # 三条路径的字节序都按固件的真实情况分开设置：
         #   轮询 FC03 = CDAB（低字在前）／写入 FC10 = DCBA（小端）／主动推流 = DCBA
@@ -194,6 +212,8 @@ class MainWindow:
         self.cli.on_log = self._on_log_thread
         self.cli.on_state = self._on_state_thread
         self.cli.on_error = self._on_error_thread
+        # 主动推流帧的回调：保存数据时用它逐帧攒数据（接收线程里执行）
+        self.cli.on_push = self._on_push_thread
 
         self.ui_queue: "queue.Queue" = queue.Queue()
         self._async_fn: Optional[Callable] = None
@@ -206,6 +226,17 @@ class MainWindow:
         self._csv_writer = None
         self._csv_rows = 0
         self._csv_last_ts = 0.0
+
+        # ---- 六维力数据保存（Excel）----
+        self.save_dir = save_dir or app_dir()
+        self.saving = False
+        self._xlsx: Optional[XlsxTableWriter] = None
+        self._save_path = ""
+        self._save_rows = 0
+        self._save_skipped = 0
+        self._save_t0 = 0.0
+        self._save_pending: deque = deque()
+        self._save_lock = threading.Lock()
 
         self._last_drawn_count = 0
         self._rate_count = 0
@@ -313,8 +344,29 @@ class MainWindow:
 
     # ---------------- 左侧控制面板 ----------------
     def _build_control_panel(self, parent: ttk.Frame) -> None:
-        box = ttk.Frame(parent)
-        box.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        # 面板分组较多，窗口不够高时靠滚动条看全。
+        # 滚轮只绑在本面板的控件上（Tk 事件不会从子控件冒到父控件），
+        # 所以不会连带把右下角的日志一起滚走。
+        outer = ttk.Frame(parent)
+        outer.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        outer.rowconfigure(0, weight=1)
+
+        self.panel_canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0,
+                                      yscrollincrement=20)
+        self.panel_sb = ttk.Scrollbar(outer, orient="vertical",
+                                      command=self.panel_canvas.yview)
+        self.panel_canvas.configure(yscrollcommand=self.panel_sb.set)
+        self.panel_canvas.grid(row=0, column=0, sticky="nsew")
+        self.panel_sb.grid(row=0, column=1, sticky="ns")
+        self.panel_sb.grid_remove()          # 内容没超高就不占位置
+        self._panel_sb_on = False
+
+        box = ttk.Frame(self.panel_canvas)
+        self._panel_box = box
+        self._panel_win = self.panel_canvas.create_window((0, 0), window=box,
+                                                          anchor="nw")
+        box.bind("<Configure>", self._on_panel_content)
+        self.panel_canvas.bind("<Configure>", self._on_panel_canvas)
         col = 0
 
         # ---- 数据流控制 ----
@@ -374,15 +426,48 @@ class MainWindow:
                                 selectcolor=CARD, highlightthickness=0)
             cb.grid(row=i // 3, column=i % 3, sticky="w")
 
-        # ---- 数据记录 ----
-        g = ttk.LabelFrame(box, text="数据记录", padding=8)
-        g.grid(row=col, column=0, sticky="ew"); col += 1
-        self.btn_rec = ttk.Button(g, text="开始记录 CSV", command=self.on_record,
-                                  width=18)
-        self.btn_rec.pack(fill="x", pady=2)
-        self.var_rec = tk.StringVar(value="未记录")
-        ttk.Label(g, textvariable=self.var_rec, foreground=TXT_DIM,
-                  wraplength=180).pack(fill="x")
+        # ---- 「开始保存数据 / 记录 CSV」不在这里 ----
+        # 这两个按钮已挪到右下角日志栏，紧挨「保存日志」，一进界面就能看到，
+        # 不再埋在左侧面板的最底部。
+
+        # 面板宽度/高度贴合内容：内容高度撑起整块 mid 区域，
+        # 窗口被压矮时 canvas 矮于内容，滚动条才会出现。
+        box.update_idletasks()
+        self.panel_canvas.configure(height=box.winfo_reqheight(),
+                                    width=box.winfo_reqwidth())
+        self._bind_panel_wheel(box)
+
+    # ---------------- 左侧面板滚动 ----------------
+    def _on_panel_content(self, event=None) -> None:
+        self.panel_canvas.configure(scrollregion=self.panel_canvas.bbox("all"))
+        self._sync_panel_sb()
+
+    def _on_panel_canvas(self, event) -> None:
+        self.panel_canvas.itemconfigure(self._panel_win, width=event.width)
+        self._sync_panel_sb()
+
+    def _sync_panel_sb(self) -> None:
+        """内容比可视区高时才把滚动条摆出来，平时不占位置。"""
+        bbox = self.panel_canvas.bbox("all")
+        h = self.panel_canvas.winfo_height()
+        need = bool(bbox) and h > 1 and (bbox[3] - bbox[1]) > h
+        if need == self._panel_sb_on:
+            return
+        self._panel_sb_on = need
+        if need:
+            self.panel_sb.grid(row=0, column=1, sticky="ns")
+        else:
+            self.panel_sb.grid_remove()
+
+    def _bind_panel_wheel(self, w) -> None:
+        w.bind("<MouseWheel>", self._on_panel_wheel)
+        for ch in w.winfo_children():
+            self._bind_panel_wheel(ch)
+
+    def _on_panel_wheel(self, event) -> str:
+        if self._panel_sb_on:
+            self.panel_canvas.yview_scroll(-int(event.delta / 120), "units")
+        return "break"
 
     # ---------------- 右侧数值 + 波形 ----------------
     def _build_display(self, parent: ttk.Frame) -> None:
@@ -581,6 +666,22 @@ class MainWindow:
         ttk.Button(top, text="清空日志", command=self.clear_log).pack(side="left", padx=8)
         ttk.Button(top, text="保存日志", command=self.save_log).pack(side="left")
 
+        # ---- 六维力数据保存 / CSV 记录 ----
+        # 紧挨「保存日志」放，一进界面就能看到（原来埋在左侧面板最底部）
+        self.btn_save = ttk.Button(top, text="开始保存数据", width=14,
+                                   command=self.on_save_toggle)
+        self.btn_save.pack(side="left", padx=(18, 0))
+        self.btn_rec = ttk.Button(top, text="记录 CSV", width=10,
+                                  command=self.on_record)
+        self.btn_rec.pack(side="left", padx=(6, 0))
+
+        self.var_save = tk.StringVar(value="未保存")
+        self.var_rec = tk.StringVar(value="未记录")
+        ttk.Label(top, textvariable=self.var_save,
+                  foreground="#b0691a").pack(side="left", padx=(14, 0))
+        ttk.Label(top, textvariable=self.var_rec,
+                  foreground=TXT_DIM).pack(side="right")
+
         self.log_text = tk.Text(wrap, height=7, bg="#1e2228", fg="#d6dae0",
                                 insertbackground="#d6dae0", relief="flat",
                                 font=("Consolas", 9), wrap="none")
@@ -612,6 +713,18 @@ class MainWindow:
 
     def _on_error_thread(self, msg: str) -> None:
         self.ui_queue.put(("error", None, msg, None))
+
+    def _on_push_thread(self, vals: List[float]) -> None:
+        """
+        接收线程回调：把每一帧六维力数据塞进待写缓冲。
+
+        这里只入队、不做任何耗时操作（落盘交给界面线程），
+        否则会拖慢 socket 收包，高速推流时会丢帧。
+        """
+        if not self.saving:
+            return
+        with self._save_lock:
+            self._save_pending.append((time.time(), list(vals)))
 
     # ==================================================================
     #  界面操作
@@ -700,6 +813,8 @@ class MainWindow:
         return f"{unit}  {lo_s} ~ {hi_s}"
 
     def on_disconnect(self) -> None:
+        if self.saving:
+            self._finish_saving("连接断开", stop_device=False)
         if self.recording:
             self.on_record()
         self.cli.close()
@@ -972,6 +1087,106 @@ class MainWindow:
 
         self._run_async(work, done, "正在读取自检寄存器")
 
+    # ---------------- 六维力数据保存（Excel）----------------
+    def on_save_toggle(self) -> None:
+        """
+        「开始保存数据」→ 把六维力数据逐帧写进 Excel；再点一次 → 停止。
+        文件默认落在程序（.exe）同目录，不用每次选路径。
+        """
+        if self.saving:
+            self._finish_saving("手动停止")
+            return
+        if not self.cli.connected:
+            messagebox.showinfo("未连接", "请先连接设备，再开始保存数据")
+            return
+
+        self._save_path = os.path.join(
+            self.save_dir, time.strftime("hs_force_%Y%m%d_%H%M%S.xlsx"))
+        try:
+            writer = XlsxTableWriter(self._save_path, headers=SAVE_HEADERS,
+                                     sheet_name="六维力数据")
+        except OSError as e:
+            messagebox.showerror(
+                "无法创建文件",
+                f"{self._save_path}\n\n{e}\n\n"
+                "如果程序放在只读目录，请把它挪到可写目录，\n"
+                "或用 --save-dir 指定一个可写目录。")
+            return
+
+        # 丢掉按下按钮之前残留在缓冲里的帧，文件从这一刻开始记
+        with self._save_lock:
+            self._save_pending.clear()
+        self._xlsx = writer
+        self._save_rows = 0
+        self._save_skipped = 0
+        self._save_t0 = time.time()
+        self.saving = True
+        self.btn_save.configure(text="停止保存数据")
+        self.var_save.set(f"保存中：0 行 · {os.path.basename(self._save_path)}")
+        self.log("SYS", f"开始保存六维力数据 → {self._save_path}")
+
+        # 「开始保存」同时开始采集：设备没在推流的话一帧都存不到
+        self._run_async(lambda: self.cli.start(), None, "正在启动连续转换")
+        self.log("SYS", "保存期间自动开启连续转换（写 0x0002 = 1）")
+
+    def _drain_save_buffer(self) -> None:
+        """把接收线程攒下的数据帧写进 Excel（只在界面线程调用）。"""
+        writer = self._xlsx
+        if writer is None:
+            return
+        with self._save_lock:
+            if not self._save_pending:
+                return
+            batch = list(self._save_pending)
+            self._save_pending.clear()
+
+        for _ts, vals in batch:
+            try:
+                if writer.add_row(vals):
+                    self._save_rows += 1
+            except XlsxLimitError as e:
+                self.log("ERR", str(e))
+                self._finish_saving("达到 Excel 单表行数上限", stop_device=False)
+                return
+        self._save_skipped = writer.skipped_rows
+        skip = f"（跳过 {self._save_skipped}）" if self._save_skipped else ""
+        self.var_save.set(f"保存中：{self._save_rows} 行{skip} · "
+                          f"{os.path.basename(self._save_path)}")
+
+    def _finish_saving(self, why: str, stop_device: bool = True) -> None:
+        """收尾：写完缓冲里最后几帧、生成 .xlsx、把按钮恢复回去。"""
+        if self._xlsx is None:
+            self.saving = False
+            return
+        self._drain_save_buffer()            # 缓冲里可能还有最后几帧
+        writer, self._xlsx = self._xlsx, None
+        self.saving = False
+        self.btn_save.configure(text="开始保存数据")
+
+        try:
+            rows = writer.close()
+        except OSError as e:
+            self.var_save.set("保存失败")
+            self.log("ERR", f"写入 Excel 失败：{e}")
+            messagebox.showerror("保存失败", f"{self._save_path}\n\n{e}")
+            return
+
+        elapsed = time.time() - self._save_t0
+        self.var_save.set(f"已保存 {rows} 行 / {elapsed:.1f} s · "
+                          f"{os.path.basename(self._save_path)}")
+        self.log("SYS", f"数据保存结束（{why}）：写入 {rows} 行，"
+                        f"用时 {elapsed:.1f} s，文件 {self._save_path}")
+        if self._save_skipped:
+            self.log("ERR", f"另有 {self._save_skipped} 行六个通道全无效被跳过"
+                            "（设备未标定时读数就是 NaN）")
+        if rows == 0:
+            self.log("ERR", "一行都没写进 Excel —— 设备可能没在连续转换，"
+                            "或六个通道读数全为 NaN（未标定）")
+
+        if stop_device and self.cli.connected:
+            self._run_async(lambda: self.cli.stop(), None, "正在停止发送")
+            self.log("SYS", "已停止连续转换（写 0x0001 = 1）")
+
     # ---------------- CSV 记录 ----------------
     def on_record(self) -> None:
         if self.recording:
@@ -979,7 +1194,7 @@ class MainWindow:
             if self._csv_file:
                 self._csv_file.close()
                 self._csv_file = None
-            self.btn_rec.configure(text="开始记录 CSV")
+            self.btn_rec.configure(text="记录 CSV")
             self.var_rec.set(f"已停止，共 {self._csv_rows} 行")
             self.log("SYS", f"数据记录结束，共 {self._csv_rows} 行")
             return
@@ -1076,6 +1291,8 @@ class MainWindow:
     def _tick(self) -> None:
         try:
             self._drain_queue()
+            # 保存落盘不依赖连接状态：断线时缓冲里已有数据也要写完
+            self._drain_save_buffer()
             if self._connected:
                 self._update_values()
                 self._update_wave()
@@ -1159,6 +1376,9 @@ class MainWindow:
         try:
             if self.recording:
                 self.on_record()
+            if self.saving:
+                # 关窗时先把已经采到的数据落盘，别丢
+                self._finish_saving("程序退出", stop_device=False)
             self.cli.close()
         except Exception:                                # noqa: BLE001
             pass
@@ -1184,6 +1404,8 @@ def main() -> int:                                       # pragma: no cover
                     choices=list(ByteOrder.ALL), help="FC03 轮询字节序")
     ap.add_argument("--write-order", default=ByteOrder.WRITE_DEFAULT,
                     choices=list(ByteOrder.ALL), help="FC10 写入 / 主动推流 字节序")
+    ap.add_argument("--save-dir", default=None,
+                    help="「开始保存数据」写出的 Excel 存放目录（默认程序所在目录）")
     ap.add_argument("--selftest", action="store_true",
                     help="仅构建界面后退出，用于检查环境")
     args = ap.parse_args()
@@ -1197,12 +1419,27 @@ def main() -> int:                                       # pragma: no cover
             pass
     root.geometry(f"{int(1380 * scale)}x{int(880 * scale)}")
     root.minsize(int(1080 * scale), int(680 * scale))
-    app = MainWindow(root, args.host, args.port, args.order, args.write_order)
+    app = MainWindow(root, args.host, args.port, args.order, args.write_order,
+                     args.save_dir)
 
     if args.selftest:
         root.update_idletasks()
         root.update()
         print("界面构建成功：", root.winfo_width(), "x", root.winfo_height())
+        print("数据保存目录：", app.save_dir)
+        # 顺便验一下 .xlsx 写出链路（打包后的 exe 最容易在这里缺东西）
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="hs_selftest_")
+        try:
+            probe = os.path.join(tmp, "probe.xlsx")
+            w = XlsxTableWriter(probe, headers=SAVE_HEADERS, sheet_name="六维力数据")
+            for i in range(5):
+                w.add_row([float(i), 1.0, 2.0, 3.0, 4.0, 5.0])
+            n = w.close()
+            print(f"Excel 写出自检：{n} 行，{os.path.getsize(probe)} 字节")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
         app.cli.close()
         root.destroy()
         return 0
